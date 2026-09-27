@@ -486,13 +486,18 @@ function getResults() {
 // never lost even if the other device was offline at the time.
 const SYNC_CONFIG_KEY = 'mts_sync_config_v1';
 const SYNC_META_KEY = 'mts_sync_meta_v1';
+// Every device that opens Mountain Theology School shares this same fixed row ID
+// and table, so once Supabase is configured on a device there is nothing else to
+// type — phone and PC sync to the exact same place automatically.
+const MTS_SYNC_ID = 'mountain-theology-school';
+const MTS_SYNC_TABLE = 'mts_sync';
 
 function getSyncConfig() {
   try {
     const raw = localStorage.getItem(SYNC_CONFIG_KEY);
     if (raw) return JSON.parse(raw);
   } catch (e) {}
-  return { url: '', id: '', autoSync: false, intervalMins: 2 };
+  return { supabaseUrl: '', supabaseKey: '', autoSync: true, intervalMins: 1 };
 }
 function setSyncConfig(cfg) {
   try { localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) {}
@@ -514,14 +519,24 @@ function markLocalDataChanged() {
   meta.lastSavedLocalAt = Date.now();
   setSyncMeta(meta);
   const cfg = getSyncConfig();
-  if (cfg.autoSync && cfg.url && cfg.id) {
+  if (cfg.autoSync && cfg.supabaseUrl && cfg.supabaseKey) {
     clearTimeout(window._mbsAutoSyncDebounce);
     window._mbsAutoSyncDebounce = setTimeout(() => { mbsSyncNow(true); }, 4000);
   }
 }
+// Builds the Supabase REST (PostgREST) endpoint for the shared sync row.
+// select=* is used for GET; for POST/PATCH the same base URL is used with an
+// upsert Prefer header so every device writes to the exact same row.
 function _syncEndpoint(cfg) {
-  let base = (cfg.url || '').trim().replace(/\/+$/, '');
-  return base + '/api/sync?id=' + encodeURIComponent(cfg.id.trim());
+  let base = (cfg.supabaseUrl || '').trim().replace(/\/+$/, '');
+  return base + '/rest/v1/' + MTS_SYNC_TABLE;
+}
+function _syncHeaders(cfg, extra) {
+  return Object.assign({
+    'apikey': cfg.supabaseKey,
+    'Authorization': 'Bearer ' + cfg.supabaseKey,
+    'Content-Type': 'application/json'
+  }, extra || {});
 }
 // One result's identity for de-duplication when merging two devices' result lists.
 function _resultKey(r) {
@@ -534,41 +549,43 @@ function mergeResults(localResults, remoteResults) {
   return Object.values(map);
 }
 
-// Pushes local appData + results up to the Worker. Overwrites the server's copy.
+// Pushes local appData + results up to Supabase as one upsert on the shared
+// MTS_SYNC_ID row, so every device (phone, PC, tablet) writes to the same place.
 function mbsSyncPush() {
   const cfg = getSyncConfig();
-  if (!cfg.url || !cfg.id) return Promise.reject(new Error('Set a Worker URL and a Sync ID first.'));
-  const body = { appData: appData, results: getResults(), savedAt: Date.now() };
+  if (!cfg.supabaseUrl || !cfg.supabaseKey) return Promise.reject(new Error('Set your Supabase Project URL and Anon Key first.'));
+  const body = { id: MTS_SYNC_ID, app_data: appData, results: getResults(), saved_at: Date.now() };
   return fetch(_syncEndpoint(cfg), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: _syncHeaders(cfg, { 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
     body: JSON.stringify(body)
   }).then(res => {
-    if (!res.ok) throw new Error('Server responded with ' + res.status);
-    return res.json();
-  }).then(json => {
+    if (!res.ok) return res.text().then(t => { throw new Error('Supabase responded with ' + res.status + (t ? ': ' + t : '')); });
     const meta = getSyncMeta();
     meta.lastPushedAt = Date.now();
     meta.lastSyncedAt = Date.now();
     setSyncMeta(meta);
-    return json;
+    return true;
   });
 }
-// Pulls the Worker's copy and merges it into local data (courses: newer savedAt wins;
-// results: merged/de-duplicated so nothing is ever lost from either device).
+// Pulls Supabase's copy of the shared row and merges it into local data
+// (courses: newer saved_at wins; results: merged/de-duplicated so nothing is
+// ever lost from either device — a result recorded on the phone survives even
+// if the PC was offline at the time, and vice versa).
 function mbsSyncPull() {
   const cfg = getSyncConfig();
-  if (!cfg.url || !cfg.id) return Promise.reject(new Error('Set a Worker URL and a Sync ID first.'));
-  return fetch(_syncEndpoint(cfg)).then(res => {
-    if (res.status === 404) return null; // nothing on the server yet
-    if (!res.ok) throw new Error('Server responded with ' + res.status);
+  if (!cfg.supabaseUrl || !cfg.supabaseKey) return Promise.reject(new Error('Set your Supabase Project URL and Anon Key first.'));
+  const url = _syncEndpoint(cfg) + '?id=eq.' + encodeURIComponent(MTS_SYNC_ID) + '&select=*';
+  return fetch(url, { headers: _syncHeaders(cfg) }).then(res => {
+    if (!res.ok) return res.text().then(t => { throw new Error('Supabase responded with ' + res.status + (t ? ': ' + t : '')); });
     return res.json();
-  }).then(remote => {
+  }).then(rows => {
+    const remote = Array.isArray(rows) ? rows[0] : null;
     const meta = getSyncMeta();
-    if (remote && remote.appData && remote.appData.courses) {
-      const remoteSavedAt = remote.savedAt || 0;
+    if (remote && remote.app_data && remote.app_data.courses) {
+      const remoteSavedAt = remote.saved_at || 0;
       if (remoteSavedAt >= (meta.lastSavedLocalAt || 0)) {
-        appData = remote.appData;
+        appData = remote.app_data;
         saveData();
       }
     }
@@ -588,8 +605,8 @@ function mbsSyncPull() {
 function mbsSyncNow(silent) {
   const cfg = getSyncConfig();
   const status = document.getElementById('syncStatus');
-  if (!cfg.url || !cfg.id) {
-    if (!silent && status) status.innerHTML = '❌ Please set and save a Worker URL and Sync ID first.';
+  if (!cfg.supabaseUrl || !cfg.supabaseKey) {
+    if (!silent && status) status.innerHTML = '❌ Please set and save your Supabase Project URL and Anon Key first.';
     return Promise.reject(new Error('Not configured'));
   }
   if (!silent && status) status.innerHTML = '⏳ Syncing...';
@@ -600,7 +617,7 @@ function mbsSyncNow(silent) {
       try { renderSyncStatusLine(); } catch (e) {}
     })
     .catch(err => {
-      if (status) status.innerHTML = '❌ Sync failed: ' + err.message + ' (check the Worker URL and your internet connection).';
+      if (status) status.innerHTML = '❌ Sync failed: ' + err.message + ' (check your Supabase URL/Key, the table setup, and your internet connection).';
     });
 }
 function mbsSyncToggleAuto(checkbox) {
@@ -608,13 +625,13 @@ function mbsSyncToggleAuto(checkbox) {
   cfg.autoSync = !!checkbox.checked;
   setSyncConfig(cfg);
   _mbsRestartAutoSyncTimer();
-  if (cfg.autoSync && cfg.url && cfg.id) mbsSyncNow(true);
+  if (cfg.autoSync && cfg.supabaseUrl && cfg.supabaseKey) mbsSyncNow(true);
 }
 function _mbsRestartAutoSyncTimer() {
   clearInterval(window._mbsAutoSyncInterval);
   const cfg = getSyncConfig();
-  if (cfg.autoSync && cfg.url && cfg.id) {
-    const mins = Math.max(1, parseInt(cfg.intervalMins) || 2);
+  if (cfg.autoSync && cfg.supabaseUrl && cfg.supabaseKey) {
+    const mins = Math.max(1, parseInt(cfg.intervalMins) || 1);
     window._mbsAutoSyncInterval = setInterval(() => { mbsSyncNow(true); }, mins * 60000);
   }
 }
@@ -1588,24 +1605,25 @@ function printResultSlip() {
 // ─────── Performance Record Sheet, Result Score Record & Certificates ───────
 function renderSyncView(main) {
   const cfg = getSyncConfig();
+  const configured = !!(cfg.supabaseUrl && cfg.supabaseKey);
   main.innerHTML = `
     <div class="card">
-      <h2>🔄 Phone ↔ PC Auto-Sync</h2>
-      <p style="color:var(--text-light); margin-bottom:1rem;">Keep the same course books and student results in sync between your phone and your PC. This uses a small Cloudflare Worker (with a KV store) that you deploy once — enter its URL below and pick a Sync ID (any short code, the same one on both devices).</p>
+      <h2>🔄 Mountain Theology School Auto-Sync (Phone ↔ PC ↔ Phone)</h2>
+      <p style="color:var(--text-light); margin-bottom:1rem;">Keep the same Theological Course Books and student results in sync automatically across every device — phone, PC, tablet. This uses Supabase (a free cloud database, no coding needed). Set it up once per device with the same Project URL and Anon Key, and every device will silently stay in sync from then on — no Sync ID to invent, it's fixed to this school automatically.</p>
       <div class="form-row" style="max-width:700px;">
         <div class="form-group" style="flex:2;">
-          <label>Worker URL</label>
-          <input type="text" id="syncUrlInput" placeholder="https://your-worker-name.franktembo23.workers.dev" value="${escapeHtml(cfg.url || '')}">
+          <label>Supabase Project URL</label>
+          <input type="text" id="syncUrlInput" placeholder="https://xxxxxxxxxxxx.supabase.co" value="${escapeHtml(cfg.supabaseUrl || '')}">
         </div>
-        <div class="form-group">
-          <label>Sync ID (same on both devices)</label>
-          <input type="text" id="syncIdInput" placeholder="e.g. mts-frank" value="${escapeHtml(cfg.id || '')}">
+        <div class="form-group" style="flex:2;">
+          <label>Supabase Anon (public) API Key</label>
+          <input type="text" id="syncKeyInput" placeholder="eyJhbGciOi..." value="${escapeHtml(cfg.supabaseKey || '')}">
         </div>
       </div>
       <div class="form-row" style="max-width:700px;">
         <div class="form-group">
           <label>Auto-Sync every (minutes)</label>
-          <input type="number" id="syncIntervalInput" min="1" max="60" value="${cfg.intervalMins || 2}">
+          <input type="number" id="syncIntervalInput" min="1" max="60" value="${cfg.intervalMins || 1}">
         </div>
         <div class="form-group" style="display:flex; align-items:flex-end;">
           <label style="display:flex; align-items:center; gap:0.5rem; font-weight:600;">
@@ -1619,14 +1637,32 @@ function renderSyncView(main) {
         <button class="btn btn-secondary" onclick="mbsManualPush()">⬆️ Push to Cloud (Overwrite Server)</button>
         <button class="btn btn-warning" onclick="mbsManualPull()">⬇️ Pull from Cloud (Overwrite This Device)</button>
       </div>
-      <div id="syncStatus" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-light);"></div>
+      <div id="syncStatus" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-light);">${configured ? '' : '⚠️ Not set up yet on this device — follow the steps below, then paste your Project URL and Anon Key above and click Save.'}</div>
       <div id="syncLastInfo" style="margin-top:0.3rem; font-size:0.85rem; color:var(--text-light);"></div>
       <div class="card" style="margin-top:1rem; background:linear-gradient(135deg,#f0f7fb,#fff); border:1px solid #c9dceb;">
-        <h2>ℹ️ How This Works</h2>
-        <p style="color:var(--text-light); font-size:0.9rem;">
-          <strong>🔄 Sync Now</strong> pulls whatever is on the server, merges it with what's on this device (newer course edits win; exam results from both devices are combined so none are ever lost), then saves the merged copy back to the server. Do this on your PC and your phone whenever you want them to match.<br><br>
-          <strong>Auto-Sync</strong> repeats "Sync Now" automatically in the background every few minutes, and also fires a few seconds after you save a course or a student submits an exam - so both devices stay up to date without you doing anything.<br><br>
-          <strong>⬆️ Push</strong> and <strong>⬇️ Pull</strong> are one-directional overrides for special cases (e.g. this device's data is damaged and you want to force-restore it from the server, or you want to force this device's data onto the server).
+        <h2>ℹ️ One-Time Supabase Setup (do this once, then reuse the same URL + Key on every device)</h2>
+        <ol style="color:var(--text-light); font-size:0.9rem; line-height:1.5; margin-left:1.2rem;">
+          <li>Go to <strong>supabase.com</strong>, sign up free, and create a new project (any name, e.g. "Mountain Theology School").</li>
+          <li>Once it's ready, open the <strong>SQL Editor</strong> and run this once to create the sync table:
+            <pre style="background:#0a1f44; color:#f0f0f0; padding:0.8rem; border-radius:6px; overflow-x:auto; font-size:0.8rem; margin:0.5rem 0;">create table if not exists mts_sync (
+  id text primary key,
+  app_data jsonb,
+  results jsonb,
+  saved_at bigint
+);
+alter table mts_sync enable row level security;
+create policy "mts anon read" on mts_sync for select using (true);
+create policy "mts anon insert" on mts_sync for insert with check (true);
+create policy "mts anon update" on mts_sync for update using (true);</pre>
+          </li>
+          <li>Open <strong>Project Settings → API</strong>. Copy the <strong>Project URL</strong> and the <strong>anon public</strong> key.</li>
+          <li>Paste both into the two fields above and click <strong>💾 Save Sync Settings</strong>.</li>
+          <li>Repeat step 4 on every other device (phone, PC, tablet) — paste the exact same Project URL and Anon Key. From then on, all devices automatically stay in sync with each other in the background.</li>
+        </ol>
+        <p style="color:var(--text-light); font-size:0.9rem; margin-top:0.6rem;">
+          <strong>🔄 Sync Now</strong> pulls whatever is on Supabase, merges it with what's on this device (newer course edits win; exam results from both devices are combined so none are ever lost), then saves the merged copy back up. Do this on your PC and your phone whenever you want them to match right away.<br><br>
+          <strong>Auto-Sync</strong> repeats "Sync Now" automatically in the background every ${cfg.intervalMins || 1} minute(s), and also fires a few seconds after you save a course or a student submits an exam — and once every device loads the app — so phone, PC and phone again stay up to date without you doing anything.<br><br>
+          <strong>⬆️ Push</strong> and <strong>⬇️ Pull</strong> are one-directional overrides for special cases (e.g. this device's data is damaged and you want to force-restore it from Supabase, or you want to force this device's data onto Supabase).
         </p>
       </div>
     </div>
@@ -1636,13 +1672,14 @@ function renderSyncView(main) {
 }
 function saveSyncSettings() {
   const cfg = getSyncConfig();
-  cfg.url = (document.getElementById('syncUrlInput').value || '').trim();
-  cfg.id = (document.getElementById('syncIdInput').value || '').trim();
-  cfg.intervalMins = Math.max(1, parseInt(document.getElementById('syncIntervalInput').value) || 2);
+  cfg.supabaseUrl = (document.getElementById('syncUrlInput').value || '').trim();
+  cfg.supabaseKey = (document.getElementById('syncKeyInput').value || '').trim();
+  cfg.intervalMins = Math.max(1, parseInt(document.getElementById('syncIntervalInput').value) || 1);
   setSyncConfig(cfg);
   _mbsRestartAutoSyncTimer();
   const status = document.getElementById('syncStatus');
   if (status) status.innerHTML = '✅ Sync settings saved. Use "Sync Now" to sync immediately, or enable Auto-Sync above.';
+  if (cfg.autoSync && cfg.supabaseUrl && cfg.supabaseKey) mbsSyncNow(true);
 }
 function mbsManualPush() {
   saveSyncSettings();
@@ -3434,7 +3471,7 @@ window.addEventListener('DOMContentLoaded', () => {
   applyRoleUI();
   try {
     const cfg = getSyncConfig();
-    if (cfg.autoSync && cfg.url && cfg.id) {
+    if (cfg.autoSync && cfg.supabaseUrl && cfg.supabaseKey) {
       _mbsRestartAutoSyncTimer();
       setTimeout(() => { mbsSyncNow(true); }, 3000);
     }
